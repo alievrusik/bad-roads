@@ -1,0 +1,10 @@
+.marker-cluster-small,
+.marker-cluster-medium,
+.marker-cluster-large {
+  background-color: rgb(253 224 71 / 0.75);
+}
+
+.marker-cluster div {
+  color: #0f172a;
+  font-weight: 600;
+}
