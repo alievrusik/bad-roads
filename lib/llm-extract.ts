@@ -1,15 +1,37 @@
 import { z } from "zod";
 
-const LlmLocationSchema = z.object({
-  name_raw: z.string(),
-  normalized_address_hint: z.string(),
-  severity_1_to_10: z.number().min(1).max(10),
-  summary_ru: z.string(),
-  confidence_0_to_1: z.number().min(0).max(1).optional(),
-  /** Одним JSON вместе с фактами: координаты в городе Томск (если уверенно), иначе null/опусти поля. */
-  lat: z.number().nullable().optional(),
-  lon: z.number().nullable().optional(),
-});
+const LlmLocationSchema = z
+  .object({
+    /** plain — жалоба из свободного текста; osm_note — одна запись на строку с координатами из батча. */
+    kind: z.enum(["plain", "osm_note"]).default("plain"),
+    /** Для kind=osm_note — id из заголовка строки (как в batch). */
+    osm_note_id: z.string().optional(),
+    name_raw: z.string(),
+    normalized_address_hint: z.string(),
+    severity_1_to_10: z.number().min(1).max(10),
+    summary_ru: z.string(),
+    confidence_0_to_1: z.number().min(0).max(1).optional(),
+    lat: z.coerce.number().nullable().optional(),
+    lon: z.coerce.number().nullable().optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.kind === "osm_note") {
+      if (!v.osm_note_id?.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "osm_note requires osm_note_id",
+          path: ["osm_note_id"],
+        });
+      }
+      if (v.lat == null || v.lon == null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "osm_note requires lat and lon from the line header",
+          path: ["lat"],
+        });
+      }
+    }
+  });
 
 const LlmExtractSchema = z.object({
   locations: z.array(LlmLocationSchema),
@@ -52,7 +74,8 @@ export function parseLlmJson(content: string): {
   if (!v.success) {
     throw new Error("LLM JSON schema mismatch");
   }
-  const locs = v.data.locations.map((l) => {
+  const locs: ExtractedLocation[] = v.data.locations.map((l) => {
+    const kind = l.kind ?? "plain";
     let lat = l.lat ?? null;
     let lon = l.lon ?? null;
     const bboxOk =
@@ -62,12 +85,13 @@ export function parseLlmJson(content: string): {
       lat <= 56.62 &&
       lon >= 84.65 &&
       lon <= 85.35;
-    if (!bboxOk) {
+    if (kind === "plain" && !bboxOk) {
       lat = null;
       lon = null;
     }
     return {
       ...l,
+      kind,
       lat,
       lon,
       confidence_0_to_1: l.confidence_0_to_1 ?? 0.65,
@@ -76,36 +100,30 @@ export function parseLlmJson(content: string): {
   return { locations: locs, warnings: v.data.warnings ?? [] };
 }
 
-const EXTRACTION_SYSTEM_EN = `You are a precise information extraction tool for Russian social media about road quality in Tomsk (Tomsk Oblast, Russia).
-The user message is ONE batch document: numbered lines. You MUST read every line for context; extract road-related locations from all relevant content.
-Some lines may be machine-prefixed: [[osm-note id=... lat=... lon=...]] followed by text — do NOT add those to "locations" (the server already has their coordinates). Use them only as context for nearby plain lines.
-From every plain (non-[[osm-note]]) line that describes a road/street problem, extract distinct locations.
-Output ONLY valid JSON (no markdown) with this shape:
-{"locations":[{"name_raw":"...","normalized_address_hint":"short Russian address with street type for geocoding","severity_1_to_10":1-10,"summary_ru":"one short Russian phrase","confidence_0_to_1":0-1,"lat":56.48,"lon":84.95}],"warnings":[]}
-Optional lat/lon: WGS84 decimals inside Tomsk urban bbox ONLY if you are confident (lat ~56.25–56.62, lon ~84.65–85.35). Otherwise omit lat/lon or set both null.
+const LLM_FETCH_TIMEOUT_MS = 45_000;
+
+const EXTRACTION_SYSTEM_EN = `You extract road complaints for Tomsk (Russia) from ONE batch user message.
+Each line is numbered. Lines marked [plain] are free-text comments. Lines marked [osm_note id=... lat=... lon=...] are OpenStreetMap notes with authoritative coordinates.
+
+Return exactly ONE JSON object (no markdown) with this structure:
+{"locations":[ ... ], "warnings":[]}
+
+Each entry in "locations" must be either:
+A) Free-text road issue from a [plain] line:
+   {"kind":"plain","name_raw":"...","normalized_address_hint":"e.g. ул. Иркутская, Томск","severity_1_to_10":1-10,"summary_ru":"...","confidence_0_to_1":0-1,"lat":null,"lon":null}
+   Optional lat/lon only if you are sure they fall in Tomsk bbox (lat ~56.25–56.62, lon ~84.65–85.35); otherwise null.
+
+B) One object per [osm_note ...] line (road-related or not — still output it if the note text mentions roads/surface/potholes OR if unsure, include with lower severity):
+   {"kind":"osm_note","osm_note_id":"<same id as in line>","name_raw":"short label","normalized_address_hint":"OpenStreetMap заметка №<id>","severity_1_to_10":1-10,"summary_ru":"from note text","confidence_0_to_1":0-1,"lat":<number>,"lon":<number>}
+   lat and lon MUST copy EXACT numeric values from that line's header (after [osm_note id=… lat=… lon=…]).
+
 Rules:
-- severity_1_to_10: 10 = emergency / deep pothole / impassable; 1 = cosmetic / minor crack.
-- If no location is explicit, skip the mention (do not invent streets).
-- Keep name_raw as in text; normalized_address_hint should be a concise geocoding query in Russian (e.g. "ул. Иркутская, Томск").
-- Duplicates in the same comment line can be merged in one object with higher severity.
-- warnings: short English notes if text is ambiguous.`;
+- Cover every [osm_note] line with exactly one osm_note object (matching osm_note_id).
+- From [plain] lines, extract every distinct street/road complaint (kind plain); merge duplicates from the same line with higher severity.
+- severity_1_to_10: 10 = emergency / impassable; 1 = cosmetic.
+- Do not invent streets. warnings in English for ambiguity.`;
 
-export function buildExtractionUserPayload(text: string): string {
-  const lines = text
-    .split(/\n+/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-  const numbered = lines.map((l, i) => `${i + 1}. ${l}`).join("\n");
-  return [
-    `Below are ${lines.length} lines in ONE batch (analyze all of them together).`,
-    "",
-    numbered,
-  ].join("\n");
-}
-
-const LLM_FETCH_TIMEOUT_MS = 22_000;
-
-export async function callVllmExtract(text: string): Promise<{
+export async function callVllmExtract(batchUserDocument: string): Promise<{
   content: string;
   provider: "vllm";
 }> {
@@ -124,10 +142,10 @@ export async function callVllmExtract(text: string): Promise<{
     body: JSON.stringify({
       model,
       temperature: 0.1,
-      max_tokens: 4096,
+      max_tokens: 8192,
       messages: [
         { role: "system", content: EXTRACTION_SYSTEM_EN },
-        { role: "user", content: buildExtractionUserPayload(text) },
+        { role: "user", content: batchUserDocument },
       ],
     }),
     signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
@@ -144,7 +162,7 @@ export async function callVllmExtract(text: string): Promise<{
   return { content, provider: "vllm" };
 }
 
-export async function callAnthropicExtract(text: string): Promise<{
+export async function callAnthropicExtract(batchUserDocument: string): Promise<{
   content: string;
   provider: "anthropic";
 }> {
@@ -174,13 +192,13 @@ export async function callAnthropicExtract(text: string): Promise<{
     },
     body: JSON.stringify({
       model,
-      max_tokens: 4096,
+      max_tokens: 8192,
       temperature: 0.1,
       system: EXTRACTION_SYSTEM_EN,
       messages: [
         {
           role: "user",
-          content: [{ type: "text", text: buildExtractionUserPayload(text) }],
+          content: [{ type: "text", text: batchUserDocument }],
         },
       ],
     }),

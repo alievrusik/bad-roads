@@ -91,11 +91,13 @@ export function heuristicExtractTomsk(text: string): {
       const merged = prev
         ? {
             ...prev,
+            kind: "plain" as const,
             severity_1_to_10: Math.max(prev.severity_1_to_10, sev),
             summary_ru: `${prev.summary_ru}; ${line.slice(0, 120)}`,
             confidence_0_to_1: Math.min(prev.confidence_0_to_1, 0.4),
           }
         : {
+            kind: "plain" as const,
             name_raw: display,
             normalized_address_hint: normalized,
             severity_1_to_10: sev,
