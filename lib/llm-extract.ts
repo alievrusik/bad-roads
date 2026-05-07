@@ -6,6 +6,9 @@ const LlmLocationSchema = z.object({
   severity_1_to_10: z.number().min(1).max(10),
   summary_ru: z.string(),
   confidence_0_to_1: z.number().min(0).max(1).optional(),
+  /** Одним JSON вместе с фактами: координаты в городе Томск (если уверенно), иначе null/опусти поля. */
+  lat: z.number().nullable().optional(),
+  lon: z.number().nullable().optional(),
 });
 
 const LlmExtractSchema = z.object({
@@ -49,17 +52,35 @@ export function parseLlmJson(content: string): {
   if (!v.success) {
     throw new Error("LLM JSON schema mismatch");
   }
-  const locs = v.data.locations.map((l) => ({
-    ...l,
-    confidence_0_to_1: l.confidence_0_to_1 ?? 0.65,
-  }));
+  const locs = v.data.locations.map((l) => {
+    let lat = l.lat ?? null;
+    let lon = l.lon ?? null;
+    const bboxOk =
+      lat != null &&
+      lon != null &&
+      lat >= 56.25 &&
+      lat <= 56.62 &&
+      lon >= 84.65 &&
+      lon <= 85.35;
+    if (!bboxOk) {
+      lat = null;
+      lon = null;
+    }
+    return {
+      ...l,
+      lat,
+      lon,
+      confidence_0_to_1: l.confidence_0_to_1 ?? 0.65,
+    };
+  });
   return { locations: locs, warnings: v.data.warnings ?? [] };
 }
 
 const EXTRACTION_SYSTEM_EN = `You are a precise information extraction tool for Russian social media about road quality in Tomsk (Tomsk Oblast, Russia).
 Extract distinct road-related locations or named streets/roads mentioned as places of complaints.
 Output ONLY valid JSON (no markdown) with this shape:
-{"locations":[{"name_raw":"...","normalized_address_hint":"short Russian address with street type for geocoding","severity_1_to_10":1-10,"summary_ru":"one short Russian phrase","confidence_0_to_1":0-1}],"warnings":[]}
+{"locations":[{"name_raw":"...","normalized_address_hint":"short Russian address with street type for geocoding","severity_1_to_10":1-10,"summary_ru":"one short Russian phrase","confidence_0_to_1":0-1,"lat":56.48,"lon":84.95}],"warnings":[]}
+Optional lat/lon: WGS84 decimals inside Tomsk urban bbox ONLY if you are confident (lat ~56.25–56.62, lon ~84.65–85.35). Otherwise omit lat/lon or set both null. Process ALL lines of input in this single response.
 Rules:
 - severity_1_to_10: 10 = emergency / deep pothole / impassable; 1 = cosmetic / minor crack.
 - If no location is explicit, skip the mention (do not invent streets).
@@ -70,6 +91,8 @@ Rules:
 export function buildExtractionUserPayload(text: string): string {
   return `Extract road complaint locations from the following Russian comments (possibly multiple lines). Comments:\n\n${text}`;
 }
+
+const LLM_FETCH_TIMEOUT_MS = 22_000;
 
 export async function callVllmExtract(text: string): Promise<{
   content: string;
@@ -96,6 +119,7 @@ export async function callVllmExtract(text: string): Promise<{
         { role: "user", content: buildExtractionUserPayload(text) },
       ],
     }),
+    signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -149,6 +173,7 @@ export async function callAnthropicExtract(text: string): Promise<{
         },
       ],
     }),
+    signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const err = await res.text();

@@ -100,9 +100,18 @@ export default function HomeShell() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
       });
-      const data = (await res.json()) as AnalyzeJson;
-      if (!data.ok || !Array.isArray(data.items)) {
-        setError(data.error ?? "Не удалось выполнить анализ.");
+      let data: AnalyzeJson;
+      try {
+        data = (await res.json()) as AnalyzeJson;
+      } catch {
+        setError(
+          `Ответ сервера не JSON (HTTP ${res.status}). Часто это таймаут или падение функции — попробуйте короче текст или повторите.`,
+        );
+        setItems([]);
+        return;
+      }
+      if (!res.ok || !data.ok || !Array.isArray(data.items)) {
+        setError(data.error ?? `Запрос завершился с ошибкой (HTTP ${res.status}).`);
         setItems([]);
         return;
       }
