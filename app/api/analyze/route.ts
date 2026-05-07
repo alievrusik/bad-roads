@@ -187,7 +187,7 @@ export async function POST(req: Request) {
     diagnostics: {
       attempts: order.join(","),
       linesReceived: lines.length,
-      geoProvider: "nominatim",
+      geoProvider: "photon_then_nominatim",
     },
   });
 }
