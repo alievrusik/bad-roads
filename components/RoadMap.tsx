@@ -23,6 +23,12 @@ function severityColor(severity: number) {
   return "#15803d";
 }
 
+/** Esri серый фон без прямой загрузки с tile.openstreetmap.org (устойчивее к CDN/Vercel). */
+const ESRI_LIGHT_GRAY =
+  "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}";
+const CARTO_LIGHT =
+  "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png";
+
 export default function RoadMap({ points }: Props) {
   const mapDivRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -34,15 +40,37 @@ export default function RoadMap({ points }: Props) {
       { lat: 56.4884, lng: 84.9481 },
       11,
     );
-    L.tileLayer(
-      "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-      {
-        maxZoom: 20,
-        subdomains: "abcd",
-        attribution:
-          '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
-      },
-    ).addTo(map);
+
+    const esriAttr =
+      '&copy; <a href="https://www.esri.com/">Esri</a>';
+    const cartoAttr =
+      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
+
+    const esri = L.tileLayer(ESRI_LIGHT_GRAY, {
+      maxZoom: 16,
+      attribution: `${esriAttr} — базовая подложка (не OSM tile cache)`,
+      crossOrigin: true,
+    });
+    const carto = L.tileLayer(CARTO_LIGHT, {
+      maxZoom: 20,
+      subdomains: "abcd",
+      attribution: `${cartoAttr} — резерв при ошибках CDN`,
+      crossOrigin: true,
+    });
+
+    let activeBasemap: L.TileLayer = esri;
+    activeBasemap.addTo(map);
+
+    let swapScheduled = false;
+    const fallbackOnce = () => {
+      if (swapScheduled) return;
+      swapScheduled = true;
+      map.removeLayer(activeBasemap);
+      activeBasemap = carto;
+      carto.addTo(map);
+      map.invalidateSize();
+    };
+    esri.once("tileerror", fallbackOnce);
 
     const mcg = L.markerClusterGroup({ chunkedLoading: true });
     map.addLayer(mcg);

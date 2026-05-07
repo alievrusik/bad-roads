@@ -45,7 +45,7 @@ function stripTrailingComplaints(nameRaw: string) {
   return s;
 }
 
-function severityFromLine(line: string): number {
+export function severityFromLine(line: string): number {
   const l = line.toLowerCase();
   if (
     /авария|яма на всю|провал|опасн|не проехать|скорая|колея|обрыв/i.test(l)

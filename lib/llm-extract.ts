@@ -113,11 +113,18 @@ export async function callAnthropicExtract(text: string): Promise<{
   content: string;
   provider: "anthropic";
 }> {
-  const proxy = process.env.ANTHROPIC_PROXY_URL?.replace(/\/$/, "");
-  const key = process.env.ANTHROPIC_API_KEY;
+  const configured =
+    process.env.ANTHROPIC_PROXY_URL?.replace(/\/$/, "") ??
+    process.env.ANTHROPIC_BASE_URL?.replace(/\/$/, "");
+  /** Прямой Anthropic Messages API без отдельного прокси (Vercel / локально). */
+  const proxy =
+    configured && configured.trim().length > 0 ? configured.trim() : "https://api.anthropic.com";
+  const key = process.env.ANTHROPIC_API_KEY?.trim();
   const model = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
-  if (!proxy || !key) {
-    throw new Error("Anthropic proxy env not configured");
+  if (!key) {
+    throw new Error(
+      "Не задан ANTHROPIC_API_KEY — укажите ключ в переменных окружения или отключите anthropic в DEMO_FOUNDATION_PROVIDERS.",
+    );
   }
   const url =
     proxy.endsWith("/v1/messages") || proxy.endsWith("/messages")

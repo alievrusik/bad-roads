@@ -4,12 +4,16 @@ import {
   type MapPointItem,
 } from "@/lib/analysis-types";
 import { geocodeTomskStreet } from "@/lib/geo";
-import { heuristicExtractTomsk } from "@/lib/heuristic-extract";
+import { heuristicExtractTomsk, severityFromLine } from "@/lib/heuristic-extract";
 import {
   callAnthropicExtract,
   callVllmExtract,
   parseLlmJson,
 } from "@/lib/llm-extract";
+import {
+  partitionOsmEmbeddedAndPlain,
+  stripHashCommentLines,
+} from "@/lib/osm-embedded-lines";
 import {
   parseProviderList,
   textAnalysisProviderOrder,
@@ -89,11 +93,29 @@ export async function POST(req: Request) {
   }
 
   const { text, maxComments } = parsed.data;
-  const lines = text.split(/\n+/).map((l) => l.trim()).filter(Boolean);
-  const clipped =
-    typeof maxComments === "number"
-      ? lines.slice(0, maxComments).join("\n")
-      : text;
+
+  let clipped = stripHashCommentLines(text);
+  if (maxComments !== undefined) {
+    const ln = clipped
+      .split(/\n+/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    clipped = ln.slice(0, maxComments).join("\n");
+  }
+
+  const { embedded: embeddedOsm, plainLines } =
+    partitionOsmEmbeddedAndPlain(clipped);
+
+  const plainJoined = plainLines.join("\n");
+  const hasPlainText = plainJoined.trim().length > 0;
+  const hasEmbeddedOsm = embeddedOsm.length > 0;
+
+  if (!hasPlainText && !hasEmbeddedOsm) {
+    return NextResponse.json(
+      { ok: false, error: "Нет строк для анализа (после удаления заголовков #)." },
+      { status: 400 },
+    );
+  }
 
   const order = textAnalysisProviderOrder(
     parseProviderList(process.env.DEMO_FOUNDATION_PROVIDERS),
@@ -101,54 +123,58 @@ export async function POST(req: Request) {
 
   const warnings: string[] = [];
   let providerUsed: string | null = null;
-  let processingMode:
+  let plainProcessingMode:
     | "foundation_vllm"
     | "foundation_anthropic"
     | "heuristic_fallback" = "heuristic_fallback";
-  let extract = heuristicExtractTomsk(clipped);
+  let extractPlain = heuristicExtractTomsk(hasPlainText ? plainJoined : "");
 
-  for (const p of order) {
-    try {
-      if (p === "vllm") {
-        const { content, provider } = await callVllmExtract(clipped);
-        extract = parseLlmJson(content);
-        providerUsed = provider;
-        processingMode = "foundation_vllm";
-        break;
+  if (hasPlainText) {
+    extractPlain = heuristicExtractTomsk(plainJoined);
+    for (const p of order) {
+      try {
+        if (p === "vllm") {
+          const { content, provider } = await callVllmExtract(plainJoined);
+          extractPlain = parseLlmJson(content);
+          providerUsed = provider;
+          plainProcessingMode = "foundation_vllm";
+          break;
+        }
+        if (p === "anthropic") {
+          const { content, provider } = await callAnthropicExtract(plainJoined);
+          extractPlain = parseLlmJson(content);
+          providerUsed = provider;
+          plainProcessingMode = "foundation_anthropic";
+          break;
+        }
+      } catch (e) {
+        warnings.push(
+          `Не удалось извлечь данные автоматической моделью: ${
+            e instanceof Error ? e.message : String(e).slice(0, 240)
+          }`,
+        );
       }
-      if (p === "anthropic") {
-        const { content, provider } = await callAnthropicExtract(clipped);
-        extract = parseLlmJson(content);
-        providerUsed = provider;
-        processingMode = "foundation_anthropic";
-        break;
-      }
-    } catch (e) {
-      warnings.push(
-        `Не удалось извлечь данные автоматической моделью: ${
-          e instanceof Error ? e.message : String(e).slice(0, 240)
-        }`,
-      );
+    }
+
+    if (!providerUsed) {
+      warnings.push(...extractPlain.warnings);
+      extractPlain = heuristicExtractTomsk(plainJoined);
+      plainProcessingMode = "heuristic_fallback";
+    } else if (extractPlain.warnings.length) {
+      warnings.push(...extractPlain.warnings);
     }
   }
 
-  if (!providerUsed) {
-    warnings.push(...extract.warnings);
-    extract = heuristicExtractTomsk(clipped);
-  } else if (extract.warnings.length) {
-    warnings.push(...extract.warnings);
-  }
-
-  const aggregated = aggregateLocations(extract.locations);
+  const aggregatedPlain = aggregateLocations(extractPlain.locations);
 
   const items: MapPointItem[] = [];
   let idx = 0;
-  for (const row of aggregated) {
+  for (const row of aggregatedPlain) {
     idx += 1;
     const freq =
       row.frequency > 1
         ? row.frequency
-        : countMentionsInText(row.name_raw, clipped);
+        : countMentionsInText(row.name_raw, plainJoined || clipped);
 
     const geo = await geocodeTomskStreet(row.normalized_address_hint);
 
@@ -163,30 +189,79 @@ export async function POST(req: Request) {
       frequency: freq,
       confidence: Math.max(0, Math.min(1, row.confidence_0_to_1)),
       explanation: undefined,
-      processingMode,
+      processingMode: plainProcessingMode,
       outputKind: geo ? "geocoded" : "coords_missing",
       geocodeWarning: geo ? undefined : "Геокодирование не нашло точку",
     });
   }
 
-  if (items.length && items.every((i) => i.lat == null)) {
+  for (let i = 0; i < embeddedOsm.length; i += 1) {
+    const e = embeddedOsm[i]!;
+    idx += 1;
+    items.push({
+      id: `pt_osm_${e.id}_${i}`,
+      locationRaw: e.text.slice(0, 220),
+      normalizedAddress: `OpenStreetMap заметка №${e.id}`,
+      lat: e.lat,
+      lon: e.lon,
+      severity: severityFromLine(e.text),
+      summary: e.text.slice(0, 200),
+      frequency: 1,
+      confidence: 0.92,
+      processingMode: "osm_note_embedded",
+      outputKind: "osm_coordinates",
+    });
+  }
+
+  if (aggregatedPlain.length > 0 && embeddedOsm.length > 0) {
+    warnings.push(
+      "Смешанный режим: свободный текст (+ геокодирование) и точки координат из заметок OpenStreetMap.",
+    );
+  }
+
+  if (embeddedOsm.length > 0 && !hasPlainText) {
+    warnings.push(
+      "Строк только с координатами OSM заметок: адреса геокодером повторно не определяются.",
+    );
+  }
+
+  const plainGeoItems = items.filter(
+    (it) => it.processingMode !== "osm_note_embedded",
+  );
+  if (
+    plainGeoItems.length &&
+    plainGeoItems.every((i) => i.lat == null)
+  ) {
     warnings.push(
       "Не удалось геокодировать адреса автоматически. Проверьте конкретность формулировок.",
     );
   }
 
+  const explanationPlain =
+    !hasPlainText
+      ? "Текстовые строки отсутствуют — извлечение по свободному тексту не выполнялось."
+      : providerUsed == null
+        ? "Анализ свободного текста выполнен локальными эвристиками без вызова языковой модели."
+        : "Извлечение адресов и оценки тяжести по свободному тексту выполнены языковой моделью на сервере.";
+
+  const explanation = hasEmbeddedOsm
+    ? `${explanationPlain} Координаты для заметок OSM взяты из открытого API и не требуют геокодирования.`
+    : explanationPlain;
+
   return NextResponse.json({
     ok: true,
     warnings,
-    explanation:
-      providerUsed == null
-        ? "Анализ выполнен локальными эвристиками без вызова языковой модели."
-        : "Извлечение адресов и оценки тяжести выполнены языковой моделью на сервере.",
+    explanation,
     providerUsed,
     items,
     diagnostics: {
       attempts: order.join(","),
-      linesReceived: lines.length,
+      linesReceived: text
+        .split(/\n+/)
+        .map((l) => l.trim())
+        .filter(Boolean).length,
+      plainLines: plainLines.length,
+      osmEmbeddedLines: embeddedOsm.length,
       geoProvider: "photon_then_nominatim",
     },
   });

@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { MapPointItem } from "@/lib/analysis-types";
 import Sam3Panel from "@/components/Sam3Panel";
 
@@ -22,8 +22,16 @@ type AnalyzeJson = {
   items?: MapPointItem[];
 };
 
+type TomskNotesJson = {
+  ok: boolean;
+  error?: string;
+  text?: string;
+};
+
 export default function HomeShell() {
-  const [text, setText] = useState(SAMPLE_TEXT);
+  const [text, setText] = useState("");
+  const [notesLoading, setNotesLoading] = useState(true);
+  const [notesLoadNote, setNotesLoadNote] = useState<string | null>(null);
   const [items, setItems] = useState<MapPointItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -36,6 +44,50 @@ export default function HomeShell() {
     () => JSON.stringify(items, null, 2),
     [items],
   );
+
+  const loadTomskNotes = useCallback(async () => {
+    setNotesLoading(true);
+    setNotesLoadNote(null);
+    setError(null);
+    try {
+      const res = await fetch("/api/tomsk-notes");
+      const data = (await res.json()) as TomskNotesJson;
+      if (data.ok && data.text) {
+        setText(data.text);
+        setNotesLoadNote(
+          "Загружены заметки OpenStreetMap для Томска и при необходимости дополнены синтетическими строками (с маркировкой источника).",
+        );
+        setError(null);
+        return;
+      }
+      if (!data.ok && data.text) {
+        setText(data.text);
+        setNotesLoadNote(
+          data.error
+            ? `Основной API недоступен (${data.error}). Показан резерв синтетических строк.`
+            : "Загрузка недоступна — показан резерв синтетических строк.",
+        );
+        setError(null);
+        return;
+      }
+      setText("");
+      setNotesLoadNote(data.error ?? "Не удалось получить данные OSM Notes.");
+      setError(
+        data.error ??
+          "Не удалось загрузить демонстрационный текст из OpenStreetMap.",
+      );
+    } catch {
+      setNotesLoadNote("Сеть недоступна — нажмите «Загрузить пример» для офлайн‑смоука или повторите позже.");
+      setText("");
+      setError("Сеть недоступна при загрузке OSM заметок.");
+    } finally {
+      setNotesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadTomskNotes();
+  }, [loadTomskNotes]);
 
   async function runAnalyze() {
     setLoading(true);
@@ -72,9 +124,11 @@ export default function HomeShell() {
           <p className="eyebrow">УК Томской области — демо</p>
           <h1>Карта дорожных жалоб</h1>
           <p className="lede">
-            Вставьте поток комментариев из соцсетей: сервер извлечёт адреса,
-            оценит тяжесть и покажет скопления на интерактивной карте (тайлы
-            CARTO, данные OpenStreetMap).
+            Текст по умолчанию подтягивается из OpenStreetMap API заметок
+            (рамка Томска); при нехватке строк добавляются синтетические
+            жалобы по темам публичных новостных материалов о дорогах (с явной
+            пометкой). Карта построена на Leaflet с подложкой Esri Gray (при сбое
+            CDN включается запасная CARTO).
           </p>
         </div>
         <div className="tag">Прототип</div>
@@ -85,6 +139,14 @@ export default function HomeShell() {
           <div className="panel-header">
             <h2>Текстовые жалобы</h2>
             <div className="actions">
+              <button
+                type="button"
+                className="ghost"
+                disabled={notesLoading}
+                onClick={() => loadTomskNotes()}
+              >
+                Обновить OSM
+              </button>
               <button
                 type="button"
                 className="ghost"
@@ -102,6 +164,11 @@ export default function HomeShell() {
               </button>
             </div>
           </div>
+          {notesLoading ? (
+            <p className="muted">Загружаются заметки OpenStreetMap…</p>
+          ) : notesLoadNote ? (
+            <p className="muted small">{notesLoadNote}</p>
+          ) : null}
           <label className="label" htmlFor="comments">
             Комментарии и посты
           </label>
@@ -110,7 +177,7 @@ export default function HomeShell() {
             value={text}
             onChange={(e) => setText(e.target.value)}
             rows={12}
-            placeholder="Вставьте список сообщений, по одному на строку…"
+            placeholder="Ожидание данных из OSM Notes или вставьте свой текст построчно…"
           />
           {error ? <p className="error">{error}</p> : null}
           {warnings.length ? (
@@ -192,9 +259,11 @@ export default function HomeShell() {
           {!hasPoints ? (
             <div className="map-placeholder">
               <p>
-                Нажмите «Анализировать», чтобы увидеть точки на карте. Пример
-                работает офлайн: при отсутствии доступа к языковой модели
-                включаются эвристики по ключевым словам для улиц Томска.
+                Нажмите «Анализировать». Точки из заметок OSM уже содержат
+                координаты из API; синтетические строки («синтетика для демо…»)
+                обрабатываются как свободный текст с геокодированием там, где это
+                удаётся. Кнопка «Загрузить пример» воспроизводит локальный смоук
+                без сетевых источников.
               </p>
             </div>
           ) : (
