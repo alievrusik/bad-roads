@@ -159,17 +159,19 @@ export async function POST(req: Request) {
         "Режим без LLM (BAD_ROADS_SKIP_LLM): разбор текста только эвристикой, быстрее и без внешних моделей.",
       );
     } else {
+      /** Вся ненулевая вставка (включая строки OSM) — один батч в LLM; эвристика по-прежнему только по «обычным» строкам. */
+      const textForLlm = clipped.trim();
       for (const p of order) {
         try {
           if (p === "vllm") {
-            const { content, provider } = await callVllmExtract(plainJoined);
+            const { content, provider } = await callVllmExtract(textForLlm);
             extractPlain = parseLlmJson(content);
             providerUsed = provider;
             plainProcessingMode = "foundation_vllm";
             break;
           }
           if (p === "anthropic") {
-            const { content, provider } = await callAnthropicExtract(plainJoined);
+            const { content, provider } = await callAnthropicExtract(textForLlm);
             extractPlain = parseLlmJson(content);
             providerUsed = provider;
             plainProcessingMode = "foundation_anthropic";

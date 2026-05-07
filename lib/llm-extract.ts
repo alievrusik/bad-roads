@@ -77,10 +77,12 @@ export function parseLlmJson(content: string): {
 }
 
 const EXTRACTION_SYSTEM_EN = `You are a precise information extraction tool for Russian social media about road quality in Tomsk (Tomsk Oblast, Russia).
-Extract distinct road-related locations or named streets/roads mentioned as places of complaints.
+The user message is ONE batch document: numbered lines. You MUST read every line for context; extract road-related locations from all relevant content.
+Some lines may be machine-prefixed: [[osm-note id=... lat=... lon=...]] followed by text — do NOT add those to "locations" (the server already has their coordinates). Use them only as context for nearby plain lines.
+From every plain (non-[[osm-note]]) line that describes a road/street problem, extract distinct locations.
 Output ONLY valid JSON (no markdown) with this shape:
 {"locations":[{"name_raw":"...","normalized_address_hint":"short Russian address with street type for geocoding","severity_1_to_10":1-10,"summary_ru":"one short Russian phrase","confidence_0_to_1":0-1,"lat":56.48,"lon":84.95}],"warnings":[]}
-Optional lat/lon: WGS84 decimals inside Tomsk urban bbox ONLY if you are confident (lat ~56.25–56.62, lon ~84.65–85.35). Otherwise omit lat/lon or set both null. Process ALL lines of input in this single response.
+Optional lat/lon: WGS84 decimals inside Tomsk urban bbox ONLY if you are confident (lat ~56.25–56.62, lon ~84.65–85.35). Otherwise omit lat/lon or set both null.
 Rules:
 - severity_1_to_10: 10 = emergency / deep pothole / impassable; 1 = cosmetic / minor crack.
 - If no location is explicit, skip the mention (do not invent streets).
@@ -89,7 +91,16 @@ Rules:
 - warnings: short English notes if text is ambiguous.`;
 
 export function buildExtractionUserPayload(text: string): string {
-  return `Extract road complaint locations from the following Russian comments (possibly multiple lines). Comments:\n\n${text}`;
+  const lines = text
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  const numbered = lines.map((l, i) => `${i + 1}. ${l}`).join("\n");
+  return [
+    `Below are ${lines.length} lines in ONE batch (analyze all of them together).`,
+    "",
+    numbered,
+  ].join("\n");
 }
 
 const LLM_FETCH_TIMEOUT_MS = 22_000;
